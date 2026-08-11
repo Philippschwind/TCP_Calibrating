@@ -6,11 +6,9 @@ import cv2
 import cv2.aruco as aruco
 import json
 import glob
+from scipy.spatial.transform import Rotation
 
-T_base_cam = np.array([[ -0.0655,   -0.8829,    0.4650,    0.19815 ],
-                       [  0.1852,    0.4472,    0.8751,   -0.62715 ],
-                       [ -0.9805,    0.1434,    0.1343,    0.44370 ],
-                       [  0,         0,         0,           1     ]])
+from load_positions import load_reference_transformations, load_ur_transformations
 
 # Image folder
 image_folder = "position_images/*.png"
@@ -22,11 +20,11 @@ with open("camera_params.json", "r") as f:
 camera_matrix = np.array(my_dict["camera_matrix"], dtype=np.float32)
 dist_coeffs = np.array(my_dict["dist_coeff"], dtype=np.float32)
 
-# Reference pose
-with open("reference_positions.json", "r") as f:
-    reference_dict = json.load(f)
+T_robs = load_ur_transformations()
+T_refs = load_reference_transformations()
 
-T_ref = np.array(reference_dict["T_ref"], dtype=np.float32)
+
+print(len(T_refs))
 
 # ChArUco board settings
 # Must match the printed board exactly
@@ -88,37 +86,39 @@ def get_pose_from_charuco(gray, min_corners=4):
     return T
 
 
-def average_transformations(transformations):
-    """
-    Average a list of 4x4 transformation matrices.
-    Translation is averaged directly.
-    Rotation is averaged in Rodrigues-vector form.
-    Works reasonably well for small pose deviations.
-    """
-    if len(transformations) == 0:
-        return None
+def calculate_base_correction(T_base_cam, T_cam_mark_new, T_cam_mark_ref):
+    """_summary_
 
+    Args:
+        T_base_cam (_type_): _description_
+        T_cam_mark_new (_type_): _description_
+        T_cam_mark_ref (_type_): _description_
+    """
+
+    T_base_new_camera_old = T_cam_mark_new @ np.linalg.inv(T_cam_mark_ref)
+    T_base_new_base_old =  T_base_cam @ T_base_new_camera_old @ np.linalg.inv(T_base_cam)
+
+    return np.linalg.inv(T_base_new_base_old)
+
+
+def average_offsets(offsets):
     translations = []
-    rvecs = []
-
-    for T in transformations:
-        R = T[:3, :3]
-        t = T[:3, 3]
-
-        rvec, _ = cv2.Rodrigues(R)
-        translations.append(t)
-        rvecs.append(rvec.flatten())
-
-    t_avg = np.mean(np.array(translations), axis=0)
-    rvec_avg = np.mean(np.array(rvecs), axis=0).reshape(3, 1)
-
-    R_avg, _ = cv2.Rodrigues(rvec_avg)
-
-    T_avg = np.eye(4, dtype=np.float32)
-    T_avg[:3, :3] = R_avg
-    T_avg[:3, 3] = t_avg
-
-    return T_avg
+    rotations = []
+    
+    for T in offsets:
+        translations.append(T[:3, 3])
+        rotations.append(Rotation.from_matrix(T[:3, :3]).as_rotvec())
+    
+    # Translation mitteln
+    t_mean = np.mean(translations, axis=0)
+    r_mean = np.mean(rotations, axis=0)
+    # Rotation mitteln
+    R_mean = Rotation.from_rotvec(r_mean).as_matrix()
+    print("Here")
+    T_mean = np.eye(4)
+    T_mean[:3, :3] = R_mean
+    T_mean[:3, 3] = t_mean
+    return T_mean
 
 def transformation_to_readable_values(T):
     """
@@ -184,7 +184,7 @@ def print_readable_transformation(T, translation_unit="m"):
 
 
 def main():
-    poses = []
+    poses_cam_new = []
     images = glob.glob(image_folder)
 
     if len(images) == 0:
@@ -208,30 +208,37 @@ def main():
             print(f"Pose konnte nicht bestimmt werden: {fname}")
             continue
 
-        poses.append(T)
+        poses_cam_new.append(T)
         print(f"Pose erfolgreich bestimmt für: {fname}")
+        print(T)
 
-    if len(poses) == 0:
+    if len(poses_cam_new) == 0:
         print("Keine gültigen Posen erkannt.")
         return
+
+    positions = []
+
+    #for i, (T_rob, T_cam) in enumerate(zip(T_robs, poses_cam_new)):
+     #   T_pos = T_rob @ T_cam
+      #  print(f"\Robopose {i+1}:")
+       # print(T_pos)
+        #positions.append(T_pos)
+
 
     # Calculate offsets relative to one reference pose
     offsets = []
 
-    T_ref_board = T_base_cam @ T_ref  # Transform reference pose to base frame
-
-
-    for i, T in enumerate(poses, start=1):
-        T_board = T_base_cam @ T  # Transform current pose to base frame
-        T_offset = T_ref_board @ np.linalg.inv(T_board)
-        offsets.append(T_offset)
-        print(f"\nOffset {i}:")
+    for i, (T_rob, T_pos, T_ref) in enumerate(zip(T_robs,poses_cam_new, T_refs)):
+        T_offset = calculate_base_correction(T_rob, T_pos, T_ref)
+        print(f"\nOffset pos {i+1}:")
         print(T_offset)
-
-    # Average all offsets into one T_offset_avg
-    T_offset_avg = average_transformations(offsets)
-
+        offsets.append(T_offset)
+    print_readable_transformation(offsets[0])
+    print_readable_transformation(offsets[1])
+    print_readable_transformation(offsets[2])
     print("\n=== Gemittelter Offset ===")
+
+    T_offset_avg = average_offsets(offsets)
     print(T_offset_avg)
 
     result = {
